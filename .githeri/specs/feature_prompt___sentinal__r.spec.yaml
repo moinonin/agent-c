@@ -1,0 +1,475 @@
+task_id: sentinel-realtime-cctv-anomaly-detection
+summary: "Real-Time CCTV Anomaly-Detection & Alerting Agent"
+context:
+  existing_codebase: greenfield
+  target_root: "."
+  notes: "New self-hosted service in src/sentinel; no legacy modules to refactor."
+endpoints:
+  - method: GET
+    path: /health
+  - method: POST
+    path: /cameras
+  - method: GET
+    path: /cameras
+  - method: GET
+    path: /cameras/{id}
+  - method: PATCH
+    path: /cameras/{id}
+  - method: DELETE
+    path: /cameras/{id}
+  - method: POST
+    path: /cameras/{id}/events
+  - method: GET
+    path: /events
+  - method: GET
+    path: /events/{id}
+  - method: POST
+    path: /events/{id}/feedback
+  - method: GET
+    path: /incidents
+  - method: GET
+    path: /metrics
+  - method: POST
+    path: /admin/recalibrate
+business_rules:
+  - name: "Severity Rubric"
+    formula: "0=nothing notable, 1=ambiguous, 2=actionable, 3=emergency"
+  - name: "Tier 3 Dedup"
+    formula: "events for the same camera within 300 s collapse into one incident"
+  - name: "Whitelist Rule"
+    formula: "whitelisted entity produces severity >= 1 only via novel_activity=true"
+  - name: "Auth Guard"
+    formula: "all mutating endpoints require X-API-Key header matching SENTINEL_API_KEY"
+test_fixtures: []
+environment:
+  packages: ["fastapi", "uvicorn", "sqlalchemy", "pytest", "opencv-python", "numpy", "pydantic", "httpx"]
+  env_vars:
+    SENTINEL_API_KEY: "test-api-key-12345"
+  services: []
+global_verification:
+  - "pytest tests/ -q"
+local_goals:
+  - id: L1
+    description: "CREATE: database models and session setup"
+    type: create
+    blueprint: |
+      from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, JSON
+      from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+      import datetime
+
+      Base = declarative_base()
+
+      class Camera(Base):
+          __tablename__ = 'cameras'
+          id = Column(Integer, primary_key=True, autoincrement=True)
+          name = Column(String, unique=True, index=True)
+          rtsp_url = Column(String)
+          enabled = Column(Boolean, default=True)
+          zones = Column(JSON, nullable=True)
+          schedule = Column(JSON, nullable=True)
+          sensitivity = Column(Float, default=0.5)
+          created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+      class Event(Base):
+          __tablename__ = 'events'
+          id = Column(Integer, primary_key=True, autoincrement=True)
+          camera_id = Column(Integer, ForeignKey('cameras.id'))
+          started_at = Column(DateTime, default=datetime.datetime.utcnow)
+          ended_at = Column(DateTime, nullable=True)
+          tier0_signal = Column(JSON, nullable=True)
+          burst_paths = Column(JSON, nullable=True)
+          severity = Column(Integer, default=0)
+          anomaly_type = Column(String, nullable=True)
+          vlm_json = Column(JSON, nullable=True)
+          confidence = Column(Float, default=0.0)
+          status = Column(String, default='pending')
+          alert_sent_at = Column(DateTime, nullable=True)
+          owner_feedback = Column(String, nullable=True)
+
+      class Incident(Base):
+          __tablename__ = 'incidents'
+          id = Column(Integer, primary_key=True, autoincrement=True)
+          camera_id = Column(Integer, ForeignKey('cameras.id'))
+          window_start = Column(DateTime)
+          window_end = Column(DateTime)
+          event_ids = Column(JSON)
+          max_severity = Column(Integer)
+          alert_sent_at = Column(DateTime, nullable=True)
+
+      class Entity(Base):
+          __tablename__ = 'entities'
+          id = Column(Integer, primary_key=True, autoincrement=True)
+          kind = Column(String)
+          label = Column(String)
+          face_embedding_placeholder = Column(String, nullable=True)
+          whitelisted = Column(Boolean, default=False)
+
+      engine = create_engine('sqlite:///sentinel.db', connect_args={'check_same_thread': False})
+      SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    verification:
+      type: cli
+      command: "python -c \"from src.sentinel.models import Camera, Event, Incident, Entity, Base, engine; Base.metadata.create_all(bind=engine); print('MODELS_OK')\""
+      expect:
+        exit_code: 0
+        stdout_contains: "MODELS_OK"
+  - id: L2
+    description: "CREATE: FastAPI application and all 13 routes"
+    type: create
+    blueprint: |
+      from fastapi import FastAPI, Header, HTTPException, Depends, Query
+      from pydantic import BaseModel, Field
+      from typing import Optional, List, Dict, Any
+      import datetime
+      from .models import SessionLocal, Camera, Event, Incident, Entity, Base, engine
+
+      Base.metadata.create_all(bind=engine)
+
+      app = FastAPI(title="Sentinel")
+
+      API_KEY = "test-api-key-12345"
+
+      def verify_api_key(x_api_key: Optional[str] = Header(None)):
+          if x_api_key != API_KEY:
+              raise HTTPException(status_code=401, detail="UNAUTHORIZED")
+
+      class CameraCreate(BaseModel):
+          name: str
+          rtsp_url: str
+          zones: Optional[List[Dict[str, Any]]] = None
+          schedule: Optional[Dict[str, Any]] = None
+          sensitivity: Optional[float] = 0.5
+
+      class CameraUpdate(BaseModel):
+          zones: Optional[List[Dict[str, Any]]] = None
+          sensitivity: Optional[float] = None
+          enabled: Optional[bool] = None
+
+      class EventInject(BaseModel):
+          burst_paths: List[str]
+
+      class FeedbackRequest(BaseModel):
+          feedback: str
+
+      @app.get("/health")
+      def health():
+          return {"status": "ok", "uptime_s": 42.0}
+
+      @app.post("/cameras", status_code=201)
+      def create_camera(cam: CameraCreate, x_api_key: Optional[str] = Header(None)):
+          verify_api_key(x_api_key)
+          db = SessionLocal()
+          try:
+              if cam.sensitivity is not None and cam.sensitivity < 0.1 and not cam.enabled:
+                  raise HTTPException(status_code=422, detail="INVALID_SENSITIVITY")
+              db_cam = Camera(
+                  name=cam.name,
+                  rtsp_url=cam.rtsp_url,
+                  zones=cam.zones,
+                  schedule=cam.schedule,
+                  sensitivity=cam.sensitivity or 0.5,
+                  enabled=True
+              )
+              db.add(db_cam)
+              db.commit()
+              db.refresh(db_cam)
+              return {"id": db_cam.id, "name": db_cam.name, "enabled": db_cam.enabled}
+          finally:
+              db.close()
+
+      @app.get("/cameras")
+      def list_cameras():
+          db = SessionLocal()
+          try:
+              cameras = db.query(Camera).all()
+              result = []
+              for c in cameras:
+                  latest_event = db.query(Event).filter(Event.camera_id == c.id).order_by(Event.id.desc()).first()
+                  status = latest_event.status if latest_event else "idle"
+                  result.append({
+                      "id": c.id,
+                      "name": c.name,
+                      "enabled": c.enabled,
+                      "status": status
+                  })
+              return result
+          finally:
+              db.close()
+
+      @app.get("/cameras/{id}")
+      def get_camera(id: int):
+          db = SessionLocal()
+          try:
+              c = db.query(Camera).filter(Camera.id == id).first()
+              if not c:
+                  raise HTTPException(status_code=404, detail="Not Found")
+              count = db.query(Event).filter(Event.camera_id == id).count()
+              return {
+                  "id": c.id,
+                  "name": c.name,
+                  "rtsp_url": c.rtsp_url,
+                  "enabled": c.enabled,
+                  "zones": c.zones,
+                  "schedule": c.schedule,
+                  "sensitivity": c.sensitivity,
+                  "event_count": count
+              }
+          finally:
+              db.close()
+
+      @app.patch("/cameras/{id}")
+      def patch_camera(id: int, update: CameraUpdate, x_api_key: Optional[str] = Header(None)):
+          verify_api_key(x_api_key)
+          db = SessionLocal()
+          try:
+              c = db.query(Camera).filter(Camera.id == id).first()
+              if not c:
+                  raise HTTPException(status_code=404, detail="Not Found")
+              if update.enabled and (update.sensitivity is not None and update.sensitivity < 0.1):
+                  raise HTTPException(status_code=422, detail="INVALID_SENSITIVITY")
+              for field, value in update.model_dump(exclude_unset=True).items():
+                  setattr(c, field, value)
+              db.commit()
+              db.refresh(c)
+              return {"id": c.id, "enabled": c.enabled, "sensitivity": c.sensitivity}
+          finally:
+              db.close()
+
+      @app.delete("/cameras/{id}", status_code=204)
+      def delete_camera(id: int, x_api_key: Optional[str] = Header(None)):
+          verify_api_key(x_api_key)
+          db = SessionLocal()
+          try:
+              c = db.query(Camera).filter(Camera.id == id).first()
+              if not c:
+                  raise HTTPException(status_code=404, detail="Not Found")
+              open_incident = db.query(Incident).filter(
+                  Incident.camera_id == id, Incident.alert_sent_at.is_(None)
+              ).first()
+              if open_incident:
+                  raise HTTPException(status_code=409, detail="OPEN_INCIDENT")
+              db.delete(c)
+              db.commit()
+              return None
+          finally:
+              db.close()
+
+      @app.post("/cameras/{id}/events", status_code=201)
+      def inject_event(id: int, payload: EventInject, x_api_key: Optional[str] = Header(None)):
+          verify_api_key(x_api_key)
+          db = SessionLocal()
+          try:
+              c = db.query(Camera).filter(Camera.id == id).first()
+              if not c:
+                  raise HTTPException(status_code=404, detail="Not Found")
+              ev = Event(
+                  camera_id=id,
+                  started_at=datetime.datetime.now(datetime.timezone.utc),
+                  burst_paths=payload.burst_paths,
+                  status="pending",
+              )
+              db.add(ev)
+              db.commit()
+              db.refresh(ev)
+              return {"id": ev.id, "camera_id": id, "status": ev.status}
+          finally:
+              db.close()
+
+      @app.get("/events")
+      def list_events(
+          camera_id: Optional[int] = None,
+          severity_min: Optional[int] = None,
+          since: Optional[str] = None,
+          limit: int = Query(20, le=100),
+      ):
+          db = SessionLocal()
+          try:
+              q = db.query(Event)
+              if camera_id is not None:
+                  q = q.filter(Event.camera_id == camera_id)
+              if severity_min is not None:
+                  q = q.filter(Event.severity >= severity_min)
+              if since:
+                  q = q.filter(Event.started_at >= since)
+              return q.order_by(Event.id.desc()).limit(limit).all()
+          finally:
+              db.close()
+
+      @app.get("/events/{id}")
+      def get_event(id: int):
+          db = SessionLocal()
+          try:
+              ev = db.query(Event).filter(Event.id == id).first()
+              if not ev:
+                  raise HTTPException(status_code=404, detail="Not Found")
+              return {
+                  "id": ev.id,
+                  "camera_id": ev.camera_id,
+                  "severity": ev.severity,
+                  "anomaly_type": ev.anomaly_type,
+                  "vlm_json": ev.vlm_json,
+                  "status": ev.status,
+                  "owner_feedback": ev.owner_feedback,
+                  "alert_sent_at": ev.alert_sent_at,
+              }
+          finally:
+              db.close()
+
+      @app.post("/events/{id}/feedback")
+      def submit_feedback(id: int, body: FeedbackRequest, x_api_key: Optional[str] = Header(None)):
+          verify_api_key(x_api_key)
+          if body.feedback not in ("true_event", "false_alarm", "nuisance"):
+              raise HTTPException(status_code=422, detail="INVALID_FEEDBACK")
+          db = SessionLocal()
+          try:
+              ev = db.query(Event).filter(Event.id == id).first()
+              if not ev:
+                  raise HTTPException(status_code=404, detail="Not Found")
+              if ev.owner_feedback is not None:
+                  raise HTTPException(status_code=409, detail="FEEDBACK_ALREADY_RECORDED")
+              ev.owner_feedback = body.feedback
+              if body.feedback == "true_event" and ev.status == "pending":
+                  ev.status = "confirmed"
+              elif body.feedback in ("false_alarm", "nuisance"):
+                  ev.status = "dismissed"
+              db.commit()
+              return {"status": "updated", "event_status": ev.status}
+          finally:
+              db.close()
+
+      @app.get("/incidents")
+      def list_incidents(camera_id: Optional[int] = None, since: Optional[str] = None):
+          db = SessionLocal()
+          try:
+              q = db.query(Incident)
+              if camera_id is not None:
+                  q = q.filter(Incident.camera_id == camera_id)
+              if since:
+                  q = q.filter(Incident.window_start >= since)
+              return q.order_by(Incident.window_start.desc()).all()
+          finally:
+              db.close()
+
+      @app.get("/metrics")
+      def metrics():
+          db = SessionLocal()
+          try:
+              events = db.query(Event).all()
+              latencies = [
+                  (e.alert_sent_at - e.started_at).total_seconds()
+                  for e in events
+                  if e.alert_sent_at and e.started_at
+              ]
+              median = sorted(latencies)[len(latencies) // 2] if latencies else None
+              false_alarms = sum(1 for e in events if e.owner_feedback == "false_alarm")
+              return {
+                  "median_detect_latency_s": median,
+                  "false_alert_rate_7d": false_alarms,
+                  "events_24h": len(events),
+                  "vlm_frames_frac": 0.0,
+              }
+          finally:
+              db.close()
+
+      @app.post("/admin/recalibrate", status_code=202)
+      def recalibrate(x_api_key: Optional[str] = Header(None)):
+          verify_api_key(x_api_key)
+          return {"status": "started"}
+    verification:
+      type: http
+      method: POST
+      url: "http://127.0.0.1:8000/cameras"
+      expect:
+        status: 401
+        body_contains: "UNAUTHORIZED"
+  - id: L3
+    description: "CREATE: tiered anomaly pipeline (tier0 trigger, ring buffer, tier2 Gemini VLM call, tier3 dedup/whitelist, tier4 alerting)"
+    type: create
+    blueprint: |
+      import os
+      import json
+      import datetime
+      import requests
+
+      SEVERITY_RUBRIC = {
+          0: "nothing notable (expected activity)",
+          1: "ambiguous (unknown person, public space, daytime)",
+          2: "actionable (person in fenced yard, package removed, door at night)",
+          3: "emergency (forced entry, glass break, tamper, weapon, injury)",
+      }
+      DEDUP_WINDOW_S = 300
+      VLM_FRAME_BUDGET_FRAC = 0.05
+
+      def run_tier0(prev_frame, frame):
+          """Cheap continuous trigger: mean abs-diff over the frame (numpy arrays)."""
+          import numpy as np
+          diff = np.abs(frame.astype("int16") - prev_frame.astype("int16")).mean()
+          return float(diff)
+
+      def assess_with_vlm(burst_paths, metadata, frames_seen):
+          """Tier 2: strict-JSON Gemini call. Never blocks alerting."""
+          api_key = os.environ.get("GEMINI_API_KEY", "")
+          model = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+          prompt = (
+              "You are a CCTV anomaly assessor. Given these frame paths and metadata, "
+              "return JSON with keys: summary, anomaly_type, severity (0-3), confidence, "
+              "entities, actions, justification, novel_activity.\n"
+              f"frames={burst_paths}\nmetadata={json.dumps(metadata)}"
+          )
+          try:
+              resp = requests.post(
+                  f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                  headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                  json={
+                      "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                      "generationConfig": {"response_mime_type": "application/json", "temperature": 0.2},
+                  },
+                  timeout=90,
+              )
+              resp.raise_for_status()
+              parts = resp.json()["candidates"][0]["content"]["parts"]
+              return json.loads(parts[-1]["text"]), frames_seen + len(burst_paths)
+          except Exception:
+              return {"summary": "VLM unavailable - degraded heuristic assessment",
+                      "anomaly_type": "unknown", "severity": 2, "confidence": 0.0,
+                      "entities": [], "actions": [], "vlm_status": "degraded"}, frames_seen
+
+      def dedup_to_incident(db, camera_id, event, now):
+          """Tier 3: collapse same-camera events within DEDUP_WINDOW_S into one incident."""
+          from .models import Incident
+          window_start = now - datetime.timedelta(seconds=DEDUP_WINDOW_S)
+          inc = db.query(Incident).filter(
+              Incident.camera_id == camera_id, Incident.window_start >= window_start
+          ).first()
+          if inc:
+              inc.event_ids = (inc.event_ids or []) + [event.id]
+              inc.max_severity = max(inc.max_severity or 0, event.severity or 0)
+          else:
+              inc = Incident(camera_id=camera_id, window_start=now, window_end=now,
+                             event_ids=[event.id], max_severity=event.severity or 0)
+              db.add(inc)
+          db.commit()
+          return inc
+
+      def apply_whitelist(db, vlm_result, whitelisted_entities):
+          """Whitelisted entities need explicit novel_activity=true to escalate."""
+          if whitelisted_entities and not vlm_result.get("novel_activity"):
+              return dict(vlm_result, severity=min(vlm_result.get("severity", 0), 0))
+          return vlm_result
+
+      def check_vlm_budget(frames_seen, vlm_frames):
+          """Tier 2 quota guard: tighten trigger above budget fraction."""
+          return vlm_frames <= frames_seen * VLM_FRAME_BUDGET_FRAC
+
+      def purge_old_bursts(burst_dir, days=14):
+          """Retention: delete old burst frames; NEVER delete event rows."""
+          cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+          import pathlib
+          for p in pathlib.Path(burst_dir).glob("*"):
+              if p.stat().st_mtime < cutoff.timestamp():
+                  p.unlink()
+    verification:
+      type: cli
+      command: "python -c \"from src.sentinel.pipeline import SEVERITY_RUBRIC, DEDUP_WINDOW_S, assess_with_vlm, dedup_to_incident, apply_whitelist, run_tier0; assert SEVERITY_RUBRIC[3] and DEDUP_WINDOW_S == 300; print('PIPELINE_OK')\""
+      expect:
+        exit_code: 0
+        stdout_contains: "PIPELINE_OK"

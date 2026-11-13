@@ -1,0 +1,42 @@
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+*.egg-info/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build / dist
+build/
+dist/
+*.egg
+
+# Databases and runtime data
+*.db
+*.sqlite
+*.sqlite3
+sentinel.db
+
+# Test artifacts
+*.log
+/tmp
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
